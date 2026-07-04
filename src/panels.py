@@ -17,13 +17,18 @@ from textual.widgets import OptionList, Static
 class FilePanel(OptionList):
     """Left panel: every FLAC file in the working directory."""
 
-    KEYBIND_HELP = "j/k \u2191/\u2193 navigate    space toggle selected    l/\u2192 focus tags"
+    KEYBIND_HELP = (
+        "j/k \u2191/\u2193 navigate    space toggle selected    "
+        "a select all    n deselect all    l/\u2192 focus tags"
+    )
 
     BINDINGS = [
         Binding("j", "cursor_down", "down", show=False),
         Binding("k", "cursor_up", "up", show=False),
         Binding("l,right", "move_right", "focus tags"),
         Binding("space", "toggle_select", "toggle selected"),
+        Binding("a", "select_all", "select all"),
+        Binding("n", "deselect_all", "deselect all"),
     ]
 
     def action_move_right(self) -> None:
@@ -32,6 +37,12 @@ class FilePanel(OptionList):
     def action_toggle_select(self) -> None:
         if self.highlighted is not None:
             self.app.on_file_toggle_select(self.highlighted)  # type: ignore[attr-defined]
+
+    def action_select_all(self) -> None:
+        self.app.on_select_all()  # type: ignore[attr-defined]
+
+    def action_deselect_all(self) -> None:
+        self.app.on_deselect_all()  # type: ignore[attr-defined]
 
 
 class TagPanel(OptionList):
@@ -75,7 +86,10 @@ class TagPanel(OptionList):
 class ValueTextPanel(OptionList):
     """Right panel, text mode: values for the currently highlighted tag."""
 
-    KEYBIND_HELP = "j/k \u2191/\u2193 scroll    h/\u2190 focus tags    r/e set value for all selected    c auto-count"
+    KEYBIND_HELP = (
+        "j/k \u2191/\u2193 scroll    h/\u2190 focus tags    "
+        "r/e set value (this file, or all if uniform)    c auto-count"
+    )
 
     BINDINGS = [
         Binding("j", "cursor_down", "down", show=False),
@@ -98,9 +112,11 @@ class ValueTextPanel(OptionList):
 class ValueImagePanel(Container, can_focus=True):
     """Right panel, image mode: cover art for the currently selected files."""
 
-    KEYBIND_HELP = "\u2191/\u2193 scroll    h/\u2190 focus tags    r/e replace cover art for all selected"
+    KEYBIND_HELP = "j/k \u2191/\u2193 scroll    h/\u2190 focus tags    r/e replace cover art for all selected"
 
     BINDINGS = [
+        Binding("up,k", "scroll_up", "up", show=False),
+        Binding("down,j", "scroll_down", "down", show=False),
         Binding("h,left", "move_left", "focus tags"),
         Binding("r,e", "replace_image", "replace image"),
     ]

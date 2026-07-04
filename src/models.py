@@ -1,11 +1,13 @@
 """Data models for the FLAC tag editor."""
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from mutagen.flac import FLAC, Picture
+from PIL import Image as PILImage
 
 # Reserved tag key used internally to represent the embedded cover art as
 # if it were just another tag in the middle panel. Vorbis comment field
@@ -14,8 +16,32 @@ from mutagen.flac import FLAC, Picture
 COVER_ART_KEY = "\x00COVER_ART\x00"
 COVER_ART_LABEL = "[Cover Art]"
 
-# The six "classic" terminal colors. Files beyond the 6th repeat the cycle.
-PALETTE = ["red", "green", "yellow", "blue", "magenta", "cyan"]
+# Six fixed hex colors (Catppuccin Mocha's accent palette), one per file,
+# repeating for files beyond the 6th. These are explicit truecolor values
+# rather than named ANSI colors like "red"/"blue" on purpose: named ANSI
+# colors are resolved through whatever 16-color palette the *terminal*
+# defines, and Textual's own ANSI-to-truecolor translation layer doesn't
+# necessarily resolve a bare color name to the same RGB in every render
+# context (e.g. inside an OptionList row vs. a plain Static). Using fixed
+# hex means the same file's color is genuinely the same value everywhere
+# (file panel, tag presence dots, value rows, image labels), not just the
+# same name.
+PALETTE = ["#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#cba6f7", "#94e2d5"]
+
+
+def dim_hex(hex_color: str, factor: float = 0.45) -> str:
+    """Darken a hex color toward black by `factor`, as a fixed computed
+    value. Used instead of Rich's "dim" style attribute, which renders as
+    a faint/alpha effect whose appearance can vary by terminal and by the
+    widget's background -- a fixed darker hex looks the same everywhere.
+    """
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    r, g, b = (round(c * factor) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+# Max pixel dimensions for the *display* thumbnail (see get_cover_thumbnail).
+THUMBNAIL_MAX_SIZE = (240, 240)
 
 
 def sniff_mime(data: bytes) -> str:
@@ -45,6 +71,9 @@ class AudioFile:
     selected: bool = True
     tags: dict[str, str] = field(default_factory=dict)
     cover_art: Optional[bytes] = None
+    # (source_bytes, PIL.Image) -- populated lazily by get_cover_thumbnail().
+    # Excluded from repr/eq so this dataclass stays readable/comparable.
+    _thumbnail_cache: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     @property
     def filename(self) -> str:
@@ -53,6 +82,34 @@ class AudioFile:
     @property
     def color(self) -> str:
         return PALETTE[(self.id - 1) % len(PALETTE)]
+
+    @property
+    def dim_color(self) -> str:
+        """Darkened version of .color, for files not in scope (e.g.
+        unselected in the file panel, or missing a given tag)."""
+        return dim_hex(self.color)
+
+    def get_cover_thumbnail(self) -> Optional[PILImage.Image]:
+        """Return a small, display-ready PIL image for the current cover
+        art, computing it only once per distinct image.
+
+        Decoding + resizing full-resolution embedded art is the expensive
+        part of showing the cover-art panel, so the result is cached and
+        keyed on the actual bytes -- if cover_art hasn't changed (the
+        common case, since it only changes via an explicit replace),
+        repeat visits to the panel are free. The cache is invalidated
+        automatically whenever cover_art is reassigned to different bytes
+        (including by undo/redo, which restores a prior bytes object).
+        """
+        if self.cover_art is None:
+            return None
+        cached = self._thumbnail_cache
+        if cached is not None and cached[0] == self.cover_art:
+            return cached[1]
+        thumbnail = PILImage.open(io.BytesIO(self.cover_art)).convert("RGB")
+        thumbnail.thumbnail(THUMBNAIL_MAX_SIZE)
+        self._thumbnail_cache = (self.cover_art, thumbnail)
+        return thumbnail
 
     def load_from_disk(self) -> None:
         """(Re)populate .tags and .cover_art by reading the file on disk.

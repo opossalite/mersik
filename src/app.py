@@ -13,14 +13,13 @@ Nothing writes to disk except do_save(), triggered by 's' + confirmation.
 """
 from __future__ import annotations
 
-import io
+import asyncio
 import sys
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image as PILImage
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Center, Horizontal, Vertical
 from textual.widgets import ContentSwitcher, Static
 from textual.widgets.option_list import Option
 from textual_image.widget import Image
@@ -39,6 +38,11 @@ class TagEditorApp(App):
         background: transparent;
     }
 
+    #loading {
+        width: 1fr;
+        height: 1fr;
+    }
+
     #body {
         height: 1fr;
     }
@@ -47,21 +51,36 @@ class TagEditorApp(App):
         width: 1fr;
         height: 1fr;
         border: round $surface-lighten-2;
-        background: transparent;
     }
 
     .panel:focus-within {
         border: round $accent;
     }
 
+    /* OptionList (and Container) default to a non-transparent $surface
+    background. Only widgets carrying the .panel class get overridden by
+    the rule above, and that class sits on the *outer* ContentSwitcher for
+    the right-hand column, not on ValueTextPanel/ValueImagePanel
+    themselves -- so without this, the right column renders against a
+    visibly different background than the left/middle columns even though
+    the foreground colors are identical strings. Setting it explicitly,
+    by type, on all four panel widgets keeps the background uniform
+    everywhere regardless of nesting. */
+    FilePanel, TagPanel, ValueTextPanel, ValueImagePanel {
+        background: transparent;
+    }
+
     ValueImagePanel {
         overflow-y: auto;
-        padding: 1;
     }
 
     ValueImagePanel .group-label {
-        margin-top: 1;
         text-style: bold;
+    }
+
+    ValueImagePanel Image {
+        height: auto;
+        margin-bottom: 1;
     }
 
     #footer {
@@ -91,29 +110,57 @@ class TagEditorApp(App):
     # -- layout ------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="body"):
-            yield FilePanel(id="file-panel", classes="panel")
-            yield TagPanel(id="tag-panel", classes="panel")
-            with ContentSwitcher(initial="value-text", id="value-switcher", classes="panel"):
-                yield ValueTextPanel(id="value-text")
-                yield ValueImagePanel(id="value-image")
-        yield KeybindFooter(id="footer")
+        with ContentSwitcher(initial="loading", id="root-switcher"):
+            with Center(id="loading"):
+                yield Static("Caching images...")
+            with Vertical(id="main"):
+                with Horizontal(id="body"):
+                    yield FilePanel(id="file-panel", classes="panel")
+                    yield TagPanel(id="tag-panel", classes="panel")
+                    with ContentSwitcher(initial="value-text", id="value-switcher", classes="panel"):
+                        yield ValueTextPanel(id="value-text")
+                        yield ValueImagePanel(id="value-image")
+                yield KeybindFooter(id="footer")
 
-    def on_mount(self) -> None:
-        self.files = scan_directory(self.directory)
+    async def on_mount(self) -> None:
+        # Scanning the directory and decoding/resizing every file's cover
+        # art up front (see models.AudioFile.get_cover_thumbnail) can take
+        # a couple of seconds for a big batch of files with large embedded
+        # art, so it happens in a worker thread while a "Caching images..."
+        # placeholder is shown, rather than freezing the UI with no
+        # feedback before it appears.
+        self.files = await asyncio.to_thread(self._load_and_cache_files)
         self.files_by_id = {f.id: f for f in self.files}
         if not self.files:
             self.notify(f"No .flac files found in {self.directory}", severity="warning", timeout=6)
         self.refresh_files()
         self.refresh_tags()
+        self.query_one("#root-switcher", ContentSwitcher).current = "main"
         file_panel = self.query_one(FilePanel)
         file_panel.focus()
-        self.query_one(KeybindFooter).show_for(file_panel)
+        self._update_footer()
+
+    def _load_and_cache_files(self) -> list[AudioFile]:
+        files = scan_directory(self.directory)
+        for f in files:
+            if f.cover_art is not None:
+                f.get_cover_thumbnail()  # populates the cache once, up front
+        return files
 
     # -- focus tracking / footer --------------------------------------
 
     def on_descendant_focus(self, event) -> None:  # noqa: ANN001
-        self.query_one(KeybindFooter).show_for(event.widget)
+        self._update_footer()
+
+    def _update_footer(self) -> None:
+        # Called after every refresh_*(), not just on focus changes --
+        # some state changes (e.g. renaming a tag) don't move focus at
+        # all, but can still change what's relevant to show, and relying
+        # solely on focus events left the footer stuck on stale text
+        # after a modal closed and returned focus programmatically.
+        footer = self.query_one(KeybindFooter)
+        if self.focused is not None:
+            footer.show_for(self.focused)
 
     def focus_file_panel(self) -> None:
         self.query_one(FilePanel).focus()
@@ -122,7 +169,7 @@ class TagEditorApp(App):
         self.query_one(TagPanel).focus()
 
     def focus_value_panel(self) -> None:
-        switcher = self.query_one(ContentSwitcher)
+        switcher = self.query_one("#value-switcher", ContentSwitcher)
         if switcher.current == "value-image":
             self.query_one(ValueImagePanel).focus()
         else:
@@ -143,6 +190,7 @@ class TagEditorApp(App):
         for f in self.files:
             panel.add_option(Option(file_option_text(f), id=str(f.id)))
         if not self.files:
+            self._update_footer()
             return
         # OptionList doesn't auto-highlight an option just because it has
         # focus, so without this, "space" would silently do nothing the
@@ -152,6 +200,7 @@ class TagEditorApp(App):
             panel.highlighted = highlighted
         else:
             panel.highlighted = 0
+        self._update_footer()
 
     def refresh_tags(self, preserve_tag: Optional[str] = None) -> None:
         panel = self.query_one(TagPanel)
@@ -177,24 +226,31 @@ class TagEditorApp(App):
             self.on_tag_highlighted(tags[new_index])
         else:
             self.on_tag_highlighted(None)
+        self._update_footer()
 
     def refresh_values(self) -> None:
         selected = self.selected_files
         tag = self.current_tag
-        switcher = self.query_one(ContentSwitcher)
+        switcher = self.query_one("#value-switcher", ContentSwitcher)
 
         if tag == COVER_ART_KEY:
             switcher.current = "value-image"
             self._populate_image_panel(selected)
+            self._update_footer()
             return
 
         switcher.current = "value-text"
         panel = self.query_one(ValueTextPanel)
         panel.clear_options()
-        if tag is None:
-            return
-        for index, line in enumerate(value_lines(tag, selected)):
-            panel.add_option(Option(line, id=str(index)))
+        if tag is not None:
+            for line, option_id in value_lines(tag, selected):
+                panel.add_option(Option(line, id=option_id))
+        # Same reasoning as refresh_files(): without an explicit default,
+        # OptionList shows no highlighted row at all after a refresh, even
+        # though the panel has content and may already have focus.
+        if panel.option_count:
+            panel.highlighted = 0
+        self._update_footer()
 
     def _populate_image_panel(self, selected: list[AudioFile]) -> None:
         panel = self.query_one(ValueImagePanel)
@@ -205,24 +261,21 @@ class TagEditorApp(App):
             return
         widgets = []
         for label, art, group_files in groups:
-            widgets.append(Static(f"{label}", classes="group-label"))
+            widgets.append(Static(label, classes="group-label"))
             if art is None:
                 widgets.append(Static("(no cover art)"))
                 continue
+            # Cover art is decoded and resized once and cached on the
+            # AudioFile itself (see get_cover_thumbnail) -- this used to
+            # redo that work from scratch on every single visit to this
+            # tag, which is what caused the multi-second lag.
+            thumbnail = group_files[0].get_cover_thumbnail()
+            if thumbnail is None:
+                widgets.append(Static("(no cover art)"))
+                continue
             try:
-                # textual-image's terminal-graphics renderer (Kitty's
-                # Unicode-placeholder method) can only address a limited
-                # number of terminal cells. Embedded cover art is often
-                # full-resolution (e.g. 3000x3000+), which blows past that
-                # limit and crashes the render. We only ever need a
-                # thumbnail on screen, so shrink a *copy* for display --
-                # the original bytes in AudioFile.cover_art are untouched
-                # and are what actually gets written back to disk.
-                thumb = PILImage.open(io.BytesIO(art))
-                thumb = thumb.convert("RGB")
-                thumb.thumbnail((320, 320))
                 image_widget = Image()
-                image_widget.image = thumb
+                image_widget.image = thumbnail
                 widgets.append(image_widget)
             except Exception as exc:
                 widgets.append(Static(f"(couldn't render image: {exc})"))
@@ -237,6 +290,18 @@ class TagEditorApp(App):
             return
         audio_file = self.files_by_id[int(option.id)]
         audio_file.selected = not audio_file.selected
+        self.refresh_files()
+        self.refresh_tags()
+
+    def on_select_all(self) -> None:
+        for f in self.files:
+            f.selected = True
+        self.refresh_files()
+        self.refresh_tags()
+
+    def on_deselect_all(self) -> None:
+        for f in self.files:
+            f.selected = False
         self.refresh_files()
         self.refresh_tags()
 
@@ -281,12 +346,35 @@ class TagEditorApp(App):
         if tag is None or tag == COVER_ART_KEY:
             return
 
+        value_panel = self.query_one(ValueTextPanel)
+        option_id = None
+        if value_panel.highlighted is not None:
+            option = value_panel.get_option_at_index(value_panel.highlighted)
+            option_id = option.id if option is not None else None
+
+        if option_id is not None and option_id.isdigit():
+            # Values differ across selected files and a specific file's
+            # row is highlighted -- edit only that file, not everyone
+            # selected, since bulk-setting here would silently overwrite
+            # values on files the user wasn't looking at.
+            target_file = self.files_by_id.get(int(option_id))
+            if target_file is None:
+                return
+            prompt = f"Set '{tag}' for '{target_file.filename}' to:"
+            targets = [target_file]
+        else:
+            # Either uniform across all selected files ("all"), or no
+            # specific row context -- bulk-set across the whole selection,
+            # same as before.
+            prompt = f"Set '{tag}' for all {len(self.selected_files)} selected files to:"
+            targets = self.selected_files
+
         def handle(new_value: Optional[str]) -> None:
             if new_value is not None:
-                mutations.set_value_all(self.selected_files, self.history, tag, new_value)
+                mutations.set_value_all(targets, self.history, tag, new_value)
                 self.refresh_tags(preserve_tag=tag)
 
-        self.push_screen(TextInputModal(f"Set '{tag}' for all selected files to:"), handle)
+        self.push_screen(TextInputModal(prompt), handle)
 
     def on_auto_count(self) -> None:
         tag = self.current_tag
