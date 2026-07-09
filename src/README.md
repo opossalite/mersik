@@ -10,7 +10,7 @@ album at once. Core design goals:
   `ARTIST` tags) as independent columns, and freeform tag names are a
   first-class citizen, not an afterthought.
 - **Opinionated about standard practice.** Album-spanning fields
-  (ALBUMARTIST, ALBUM, DISCTOTAL, etc.) get pinned and edited once for the
+  (ALBUMARTIST, ALBUM, etc.) get pinned and edited once for the
   whole album. Track/disc numbering is derived automatically from row
   order + disc grouping rather than typed by hand.
 - **Nothing touches disk until you explicitly save**, and save always
@@ -202,7 +202,9 @@ last working session.
 
 In no particular order:
 
-1. Shorten the length of cells (too long horizontally)
+1. Shorten the length of cells (too long horizontally), maybe
+    allow the columns to be flexible in terms of their length
+    (up to a maximum, but shrinking them accordingly as well).
 
 2. Vim keys for navigation don't work, only arrow keys right now
     are working
@@ -230,4 +232,18 @@ In no particular order:
     for that column. If there are different values, it should not
     get pinned, but rather should show up at the start of the
     unpinned section.
+
+7. Apart from the disc gutter, the filename should appear as the
+    left-most column
+
+8. Any column that is not editable should pop up when `i` is pressed,
+    just like if we were editing it, but it will not be editable.
+    This is mostly geared for the filename, since they can be long.
+
+9. Cover arts should say the resolution of the stored image, and the
+    type of the image itself.
+
+10. Address certain keybinds not displaying properly (the quit without
+    saving keybind when user wants to exit without saving, several
+    keybinds on the cover art part, etc)
 
