@@ -1,449 +1,680 @@
-"""Main application: layout, focus routing, and wiring panel keybinds to
-the mutation functions in mutations.py.
-
-Overall flow for any edit:
-  1. A panel's keybind calls an app.on_xxx() method (usually via a modal
-     prompt for input first).
-  2. on_xxx() calls the matching function in mutations.py, passing
-     self.selected_files -- so it is impossible for an edit to reach an
-     unselected file.
-  3. on_xxx() calls the relevant refresh_*() method(s) to re-render.
-
-Nothing writes to disk except do_save(), triggered by 's' + confirmation.
-"""
+"""Mersik2 - matrix-based FLAC tag editor."""
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
-from typing import Optional
 
 from textual.app import App, ComposeResult
-from textual.containers import Center, Horizontal, Vertical
-from textual.widgets import ContentSwitcher, Static
-from textual.widgets.option_list import Option
-from textual_image.widget import Image
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Input, Label, Static
+from textual_image.widget import Image as TermImage
 
-import mutations
-from history import HistoryManager, collapse_pending
-from models import AudioFile, COVER_ART_KEY, scan_directory
-from modals import ConfirmModal, TextInputModal
-from panels import FilePanel, KeybindFooter, TagPanel, ValueImagePanel, ValueTextPanel
-from rendering import file_option_text, image_groups, tag_option_text, value_lines
+from models import MatrixModel, Column, Track, sniff_mime
+
+PALETTE = ["#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#cba6f7", "#94e2d5"]
 
 
-class TagEditorApp(App):
-    CSS = """
-    Screen {
-        background: transparent;
+def disc_color(disc: int) -> str:
+    return PALETTE[(disc - 1) % len(PALETTE)]
+
+
+class PromptScreen(ModalScreen[str]):
+    """Simple text-input modal, used for new column names."""
+
+    DEFAULT_CSS = """
+    PromptScreen {
+        align: center middle;
     }
-
-    #loading {
-        width: 1fr;
-        height: 1fr;
+    #dialog {
+        width: 50;
+        height: auto;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
     }
+    """
 
+    def __init__(self, prompt: str, initial: str = "") -> None:
+        super().__init__()
+        self.prompt = prompt
+        self.initial = initial
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self.prompt)
+            yield Input(value=self.initial, id="prompt_input")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class EditCellScreen(ModalScreen[str]):
+    """Edit-mode input for a single cell, prefilled with current value."""
+
+    DEFAULT_CSS = """
+    EditCellScreen {
+        align: center middle;
+    }
+    #dialog {
+        width: 60;
+        height: auto;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    """
+
+    def __init__(self, key_label: str, value: str) -> None:
+        super().__init__()
+        self.key_label = key_label
+        self.value = value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Editing {self.key_label}")
+            yield Input(value=self.value, id="edit_input")
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#edit_input", Input)
+        inp.focus()
+        inp.cursor_position = len(inp.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class SaveDiffScreen(ModalScreen[bool]):
+    """Summary of pending changes before writing to disk."""
+
+    DEFAULT_CSS = """
+    SaveDiffScreen {
+        align: center middle;
+    }
+    #dialog {
+        width: 90%;
+        height: 80%;
+        border: thick $accent;
+        background: $panel;
+        padding: 1 2;
+    }
     #body {
         height: 1fr;
     }
-
-    .panel {
-        width: 1fr;
-        height: 1fr;
-        border: round $surface-lighten-2;
-    }
-
-    .panel:focus-within {
-        border: round $accent;
-    }
-
-    /* OptionList (and Container) default to a non-transparent $surface
-    background. Only widgets carrying the .panel class get overridden by
-    the rule above, and that class sits on the *outer* ContentSwitcher for
-    the right-hand column, not on ValueTextPanel/ValueImagePanel
-    themselves -- so without this, the right column renders against a
-    visibly different background than the left/middle columns even though
-    the foreground colors are identical strings. Setting it explicitly,
-    by type, on all four panel widgets keeps the background uniform
-    everywhere regardless of nesting. */
-    FilePanel, TagPanel, ValueTextPanel, ValueImagePanel {
-        background: transparent;
-    }
-
-    ValueImagePanel {
-        overflow-y: auto;
-    }
-
-    ValueImagePanel .group-label {
-        text-style: bold;
-    }
-
-    ValueImagePanel Image {
+    #actions {
         height: auto;
-        margin-bottom: 1;
-    }
-
-    #footer {
-        dock: bottom;
-        height: 1;
-        background: $surface;
-        color: $text-muted;
-        padding: 0 1;
+        padding-top: 1;
     }
     """
 
     BINDINGS = [
-        ("q", "quit_confirm", "quit"),
-        ("s", "save_confirm", "save"),
-        ("u", "undo", "undo"),
-        ("y", "redo", "redo"),
+        Binding("y", "confirm", "Confirm save"),
+        Binding("n", "cancel", "Cancel"),
+        Binding("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, model: MatrixModel) -> None:
         super().__init__()
-        self.directory = directory
-        self.files: list[AudioFile] = []
-        self.files_by_id: dict[int, AudioFile] = {}
-        self.history = HistoryManager()
-        self.current_tag: Optional[str] = None
-
-    # -- layout ------------------------------------------------------
+        self.model = model
 
     def compose(self) -> ComposeResult:
-        with ContentSwitcher(initial="loading", id="root-switcher"):
-            with Center(id="loading"):
-                yield Static("Caching images...")
-            with Vertical(id="main"):
-                with Horizontal(id="body"):
-                    yield FilePanel(id="file-panel", classes="panel")
-                    yield TagPanel(id="tag-panel", classes="panel")
-                    with ContentSwitcher(initial="value-text", id="value-switcher", classes="panel"):
-                        yield ValueTextPanel(id="value-text")
-                        yield ValueImagePanel(id="value-image")
-                yield KeybindFooter(id="footer")
+        with Vertical(id="dialog"):
+            yield Label("Save changes? (y = confirm, n/esc = cancel)")
+            with VerticalScroll(id="body"):
+                any_changes = False
+                for track in self.model.ordered_tracks():
+                    changes = self.model.diff_for_track(track)
+                    if changes:
+                        any_changes = True
+                        yield Label(f"[b]{track.filename}[/b]")
+                        for c in changes:
+                            yield Label(f"  {c}")
+                if not any_changes:
+                    yield Label("No changes staged.")
+            yield Label("", id="actions")
 
-    async def on_mount(self) -> None:
-        # Scanning the directory and decoding/resizing every file's cover
-        # art up front (see models.AudioFile.get_cover_thumbnail) can take
-        # a couple of seconds for a big batch of files with large embedded
-        # art, so it happens in a worker thread while a "Caching images..."
-        # placeholder is shown, rather than freezing the UI with no
-        # feedback before it appears.
-        self.files = await asyncio.to_thread(self._load_and_cache_files)
-        self.files_by_id = {f.id: f for f in self.files}
-        if not self.files:
-            self.notify(f"No .flac files found in {self.directory}", severity="warning", timeout=6)
-        self.refresh_files()
-        self.refresh_tags()
-        self.query_one("#root-switcher", ContentSwitcher).current = "main"
-        file_panel = self.query_one(FilePanel)
-        file_panel.focus()
-        self._update_footer()
+    def action_confirm(self) -> None:
+        self.dismiss(True)
 
-    def _load_and_cache_files(self) -> list[AudioFile]:
-        files = scan_directory(self.directory)
-        for f in files:
-            if f.cover_art is not None:
-                f.get_cover_thumbnail()  # populates the cache once, up front
-        return files
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
-    # -- focus tracking / footer --------------------------------------
 
-    def on_descendant_focus(self, event) -> None:  # noqa: ANN001
-        self._update_footer()
+class ConfirmQuitScreen(ModalScreen[bool]):
+    DEFAULT_CSS = """
+    ConfirmQuitScreen {
+        align: center middle;
+    }
+    #dialog {
+        width: 60;
+        height: auto;
+        border: thick $error;
+        background: $panel;
+        padding: 1 2;
+    }
+    """
 
-    def _update_footer(self) -> None:
-        # Called after every refresh_*(), not just on focus changes --
-        # some state changes (e.g. renaming a tag) don't move focus at
-        # all, but can still change what's relevant to show, and relying
-        # solely on focus events left the footer stuck on stale text
-        # after a modal closed and returned focus programmatically.
-        footer = self.query_one(KeybindFooter)
-        if self.focused is not None:
-            footer.show_for(self.focused)
+    BINDINGS = [
+        Binding("y", "confirm", "Quit without saving"),
+        Binding("n,escape", "cancel", "Cancel"),
+    ]
 
-    def focus_file_panel(self) -> None:
-        self.query_one(FilePanel).focus()
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
 
-    def focus_tag_panel(self) -> None:
-        self.query_one(TagPanel).focus()
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self.message)
+            yield Label("[y] quit without saving   [n/esc] cancel")
 
-    def focus_value_panel(self) -> None:
-        switcher = self.query_one("#value-switcher", ContentSwitcher)
-        if switcher.current == "value-image":
-            self.query_one(ValueImagePanel).focus()
-        else:
-            self.query_one(ValueTextPanel).focus()
+    def action_confirm(self) -> None:
+        self.dismiss(True)
 
-    # -- derived state --------------------------------------------------
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
-    @property
-    def selected_files(self) -> list[AudioFile]:
-        return [f for f in self.files if f.selected]
 
-    # -- refresh helpers --------------------------------------------------
+class MatrixScreen(Screen):
+    BINDINGS = [
+        Binding("i", "edit_cell", "Edit"),
+        Binding("a", "add_column", "Add column"),
+        Binding("d", "duplicate_column", "Duplicate column"),
+        Binding("x", "delete_column", "Delete column"),
+        Binding("n", "auto_number", "Auto-number"),
+        Binding("shift+j,shift+down", "move_row(1)", "Move row down"),
+        Binding("shift+k,shift+up", "move_row(-1)", "Move row up"),
+        Binding("plus,equals_sign", "change_disc(1)", "Disc +"),
+        Binding("minus", "change_disc(-1)", "Disc -"),
+        Binding("shift+h,shift+left", "reorder_column(-1)", "Move column left"),
+        Binding("shift+l,shift+right", "reorder_column(1)", "Move column right"),
+        Binding("p", "toggle_pin", "Toggle pin"),
+        Binding("z", "undo", "Undo"),
+        Binding("y", "redo", "Redo"),
+        Binding("w", "save", "Save"),
+        Binding("s", "save", "Save"),
+        Binding("c", "cover_art", "Cover art page"),
+        Binding("q", "request_quit", "Quit"),
+        Binding("slash", "search", "Search"),
+        Binding("right_bracket", "search_next(1)", "Next match"),
+        Binding("left_bracket", "search_next(-1)", "Previous match"),
+    ]
 
-    def refresh_files(self) -> None:
-        panel = self.query_one(FilePanel)
-        highlighted = panel.highlighted
-        panel.clear_options()
-        for f in self.files:
-            panel.add_option(Option(file_option_text(f), id=str(f.id)))
-        if not self.files:
-            self._update_footer()
+    MAX_CELL_WIDTH = 40
+
+    ROW_KEY_PREFIX = "row-"
+
+    def __init__(self, model: MatrixModel) -> None:
+        super().__init__()
+        self.model = model
+        self.last_search: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="empty_state")
+        yield DataTable(id="matrix", cursor_type="cell", zebra_stripes=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        if not self.model.tracks:
+            self.query_one("#matrix", DataTable).display = False
+            self.query_one("#empty_state", Static).update(
+                "No .flac files found in this folder (checked recursively). "
+                "Nothing to edit here -- point mersik at a folder containing "
+                "FLAC files and restart."
+            )
             return
-        # OptionList doesn't auto-highlight an option just because it has
-        # focus, so without this, "space" would silently do nothing the
-        # moment the panel is first focused. Default to the first file,
-        # or preserve position across refreshes.
-        if highlighted is not None and highlighted < len(self.files):
-            panel.highlighted = highlighted
-        else:
-            panel.highlighted = 0
-        self._update_footer()
+        self.query_one("#empty_state", Static).display = False
+        self.rebuild_table()
 
-    def refresh_tags(self, preserve_tag: Optional[str] = None) -> None:
-        panel = self.query_one(TagPanel)
-        selected = self.selected_files
-        tag_names = sorted({t for f in selected for t in f.tags.keys()})
-        has_cover = any(f.cover_art is not None for f in selected)
-        tags = ([COVER_ART_KEY] if has_cover else []) + tag_names
+    # -- table construction -------------------------------------------
 
-        current = preserve_tag
-        if current is None:
-            current = self.current_tag
-        if current is None and panel.highlighted is not None:
-            existing = panel.get_option_at_index(panel.highlighted)
-            current = existing.id if existing is not None else None
+    def rebuild_table(self, keep_cursor: tuple[int, int] | None = None) -> None:
+        table = self.query_one("#matrix", DataTable)
+        cursor = keep_cursor or (
+            (table.cursor_row, table.cursor_column) if table.columns else (0, 0)
+        )
+        table.clear(columns=True)
 
-        panel.clear_options()
-        for tag in tags:
-            panel.add_option(Option(tag_option_text(tag, selected), id=tag))
+        table.add_column("Disc", key="__disc__", width=6)
+        for col in self.model.columns:
+            label = col.key + (" [dim](pinned)[/dim]" if col.pinned else "")
+            table.add_column(label, key=str(col.id), width=self.MAX_CELL_WIDTH + 2)
 
-        if tags:
-            new_index = tags.index(current) if current in tags else 0
-            panel.highlighted = new_index
-            self.on_tag_highlighted(tags[new_index])
-        else:
-            self.on_tag_highlighted(None)
-        self._update_footer()
+        for track in self.model.ordered_tracks():
+            color = disc_color(track.disc)
+            row: list[str] = [f"[{color}]D{track.disc}[/{color}]"]
+            for col in self.model.columns:
+                value = track.slots.get(col.id, "")
+                row.append(self._truncate(value))
+            table.add_row(*row, key=str(id(track)))
 
-    def refresh_values(self) -> None:
-        selected = self.selected_files
-        tag = self.current_tag
-        switcher = self.query_one("#value-switcher", ContentSwitcher)
+        self._track_by_rowkey = {str(id(t)): t for t in self.model.ordered_tracks()}
+        self._col_by_id = {c.id: c for c in self.model.columns}
 
-        if tag == COVER_ART_KEY:
-            switcher.current = "value-image"
-            self._populate_image_panel(selected)
-            self._update_footer()
-            return
+        if table.row_count:
+            r = min(cursor[0], table.row_count - 1)
+            c = min(cursor[1], len(table.columns) - 1)
+            table.cursor_coordinate = Coordinate(r, c)
 
-        switcher.current = "value-text"
-        panel = self.query_one(ValueTextPanel)
-        panel.clear_options()
-        if tag is not None:
-            for line, option_id in value_lines(tag, selected):
-                panel.add_option(Option(line, id=option_id))
-        # Same reasoning as refresh_files(): without an explicit default,
-        # OptionList shows no highlighted row at all after a refresh, even
-        # though the panel has content and may already have focus.
-        if panel.option_count:
-            panel.highlighted = 0
-        self._update_footer()
+    def current_track(self) -> Track | None:
+        table = self.query_one("#matrix", DataTable)
+        if not table.row_count:
+            return None
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        return self._track_by_rowkey.get(row_key)
 
-    def _populate_image_panel(self, selected: list[AudioFile]) -> None:
-        panel = self.query_one(ValueImagePanel)
-        panel.remove_children()
-        groups = image_groups(selected)
-        if not groups:
-            panel.mount(Static("No files selected.", classes="group-label"))
-            return
-        widgets = []
-        for label, art, group_files in groups:
-            widgets.append(Static(label, classes="group-label"))
-            if art is None:
-                widgets.append(Static("(no cover art)"))
-                continue
-            # Cover art is decoded and resized once and cached on the
-            # AudioFile itself (see get_cover_thumbnail) -- this used to
-            # redo that work from scratch on every single visit to this
-            # tag, which is what caused the multi-second lag.
-            thumbnail = group_files[0].get_cover_thumbnail()
-            if thumbnail is None:
-                widgets.append(Static("(no cover art)"))
-                continue
-            try:
-                image_widget = Image()
-                image_widget.image = thumbnail
-                widgets.append(image_widget)
-            except Exception as exc:
-                widgets.append(Static(f"(couldn't render image: {exc})"))
-        panel.mount_all(widgets)
+    def current_column(self) -> Column | None:
+        table = self.query_one("#matrix", DataTable)
+        if not table.columns:
+            return None
+        col_key = table.coordinate_to_cell_key(table.cursor_coordinate).column_key.value
+        if col_key == "__disc__":
+            return None
+        return self._col_by_id.get(int(col_key))
 
-    # -- panel callbacks --------------------------------------------------
+    @classmethod
+    def _truncate(cls, value: str) -> str:
+        """Display-only truncation -- the underlying stored value in
+        track.slots is never touched, so editing a cell always shows
+        the full text regardless of how it's rendered here."""
+        if len(value) <= cls.MAX_CELL_WIDTH:
+            return value
+        return value[: cls.MAX_CELL_WIDTH - 1] + "…"
 
-    def on_file_toggle_select(self, highlighted_index: int) -> None:
-        panel = self.query_one(FilePanel)
-        option = panel.get_option_at_index(highlighted_index)
-        if option is None or option.id is None:
-            return
-        audio_file = self.files_by_id[int(option.id)]
-        audio_file.selected = not audio_file.selected
-        self.refresh_files()
-        self.refresh_tags()
+    # -- search -----------------------------------------------------
 
-    def on_select_all(self) -> None:
-        for f in self.files:
-            f.selected = True
-        self.refresh_files()
-        self.refresh_tags()
+    def _row_matches(self, track: Track, query: str) -> bool:
+        query = query.lower()
+        if query in track.filename.lower():
+            return True
+        for col in self.model.columns:
+            if query in track.slots.get(col.id, "").lower():
+                return True
+        return False
 
-    def on_deselect_all(self) -> None:
-        for f in self.files:
-            f.selected = False
-        self.refresh_files()
-        self.refresh_tags()
+    def _jump_to_row(self, row_index: int) -> None:
+        table = self.query_one("#matrix", DataTable)
+        table.cursor_coordinate = Coordinate(row_index, table.cursor_column)
 
-    def on_tag_highlighted(self, tag_id: Optional[str]) -> None:
-        self.current_tag = tag_id
-        self.refresh_values()
-
-    def on_tag_add(self) -> None:
-        def handle(name: Optional[str]) -> None:
-            name = (name or "").strip()
-            if name:
-                mutations.add_tag(self.selected_files, self.history, name)
-                self.refresh_tags(preserve_tag=name)
-
-        self.push_screen(TextInputModal("New tag name (applies to all selected files):"), handle)
-
-    def on_tag_rename(self) -> None:
-        tag = self.current_tag
-        if tag is None or tag == COVER_ART_KEY:
+    def action_search(self) -> None:
+        if not self.model.tracks:
             return
 
-        def handle(new_name: Optional[str]) -> None:
-            new_name = (new_name or "").strip()
-            if new_name and new_name != tag:
-                mutations.rename_tag(self.selected_files, self.history, tag, new_name)
-                self.refresh_tags(preserve_tag=new_name)
-
-        self.push_screen(TextInputModal(f"Rename tag '{tag}' to:", initial=tag), handle)
-
-    def on_tag_delete(self) -> None:
-        tag = self.current_tag
-        if tag is None:
-            return
-        if tag == COVER_ART_KEY:
-            mutations.delete_cover_art(self.selected_files, self.history)
-        else:
-            mutations.delete_tag(self.selected_files, self.history, tag)
-        self.refresh_tags()
-
-    def on_value_rename(self) -> None:
-        tag = self.current_tag
-        if tag is None or tag == COVER_ART_KEY:
-            return
-
-        value_panel = self.query_one(ValueTextPanel)
-        option_id = None
-        if value_panel.highlighted is not None:
-            option = value_panel.get_option_at_index(value_panel.highlighted)
-            option_id = option.id if option is not None else None
-
-        if option_id is not None and option_id.isdigit():
-            # Values differ across selected files and a specific file's
-            # row is highlighted -- edit only that file, not everyone
-            # selected, since bulk-setting here would silently overwrite
-            # values on files the user wasn't looking at.
-            target_file = self.files_by_id.get(int(option_id))
-            if target_file is None:
+        def handle(query: str | None) -> None:
+            if not query:
                 return
-            prompt = f"Set '{tag}' for '{target_file.filename}' to:"
-            targets = [target_file]
-        else:
-            # Either uniform across all selected files ("all"), or no
-            # specific row context -- bulk-set across the whole selection,
-            # same as before.
-            prompt = f"Set '{tag}' for all {len(self.selected_files)} selected files to:"
-            targets = self.selected_files
+            self.last_search = query
+            self._do_search(direction=1, include_current=True)
 
-        def handle(new_value: Optional[str]) -> None:
-            if new_value is not None:
-                mutations.set_value_all(targets, self.history, tag, new_value)
-                self.refresh_tags(preserve_tag=tag)
+        self.app.push_screen(
+            PromptScreen("Search (filename or any tag value):", initial=self.last_search or ""),
+            handle,
+        )
 
-        self.push_screen(TextInputModal(prompt), handle)
-
-    def on_auto_count(self) -> None:
-        tag = self.current_tag
-        if tag is None or tag == COVER_ART_KEY:
+    def action_search_next(self, direction: int) -> None:
+        if not self.last_search:
+            self.action_search()
             return
-        mutations.auto_count(self.selected_files, self.history, tag)
-        self.refresh_tags(preserve_tag=tag)
+        self._do_search(direction=direction, include_current=False)
 
-    def on_image_replace(self) -> None:
-        def handle(path_str: Optional[str]) -> None:
-            if not path_str:
+    def _do_search(self, direction: int, include_current: bool) -> None:
+        table = self.query_one("#matrix", DataTable)
+        if not table.row_count or not self.last_search:
+            return
+        ordered = self.model.ordered_tracks()
+        n = len(ordered)
+        start = table.cursor_row if include_current else table.cursor_row + direction
+        for step in range(n + 1):
+            idx = (start + step * direction) % n
+            if ordered[idx] is not None and self._row_matches(ordered[idx], self.last_search):
+                self._jump_to_row(idx)
                 return
-            try:
-                mutations.replace_image(self.selected_files, self.history, Path(path_str.strip()))
-            except Exception as exc:  # bad path / unreadable image
-                self.notify(f"Couldn't load image: {exc}", severity="error", timeout=6)
-            self.refresh_tags(preserve_tag=COVER_ART_KEY)
+        self.notify(f"No match for '{self.last_search}'.", severity="warning")
 
-        self.push_screen(TextInputModal("Path to new cover image:"), handle)
+    # -- actions --------------------------------------------------------
 
-    # -- global actions --------------------------------------------------
+    def action_edit_cell(self) -> None:
+        track = self.current_track()
+        col = self.current_column()
+        if track is None:
+            return
+        if col is None:
+            return  # disc column: edited via +/- instead
+        current = track.slots.get(col.id, "")
+
+        def handle(result: str | None) -> None:
+            if result is None:
+                return
+            self.model.push_history()
+            if col.pinned:
+                self.model.set_pinned_value(col, result)
+            else:
+                track.slots[col.id] = result
+            table = self.query_one("#matrix", DataTable)
+            self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+
+        self.app.push_screen(EditCellScreen(col.key, current), handle)
+
+    def action_add_column(self) -> None:
+        col = self.current_column()
+
+        def handle(name: str | None) -> None:
+            if not name:
+                return
+            self.model.push_history()
+            new_col = self.model.add_column(after=col, key=name.strip())
+            table = self.query_one("#matrix", DataTable)
+            self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+
+        self.app.push_screen(PromptScreen("New column name:"), handle)
+
+    def action_duplicate_column(self) -> None:
+        col = self.current_column()
+        if col is None:
+            return
+        self.model.push_history()
+        self.model.duplicate_column(col)
+        table = self.query_one("#matrix", DataTable)
+        self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+
+    def action_delete_column(self) -> None:
+        col = self.current_column()
+        if col is None:
+            return
+        self.model.push_history()
+        self.model.delete_column(col)
+        table = self.query_one("#matrix", DataTable)
+        self.rebuild_table(keep_cursor=(table.cursor_row, max(0, table.cursor_column - 1)))
+
+    def action_auto_number(self) -> None:
+        self.model.push_history()
+        self.model.auto_number()
+        self.notify("Track/disc numbers recomputed.")
+
+    def action_move_row(self, delta: int) -> None:
+        track = self.current_track()
+        if track is None:
+            return
+        self.model.push_history()
+        self.model.move_track(track, delta)
+        table = self.query_one("#matrix", DataTable)
+        new_row = max(0, min(table.row_count - 1, table.cursor_row + delta))
+        self.rebuild_table(keep_cursor=(new_row, table.cursor_column))
+
+    def action_change_disc(self, delta: int) -> None:
+        track = self.current_track()
+        if track is None:
+            return
+        new_disc = track.disc + delta
+        if new_disc < 1:
+            return
+        self.model.push_history()
+        self.model.set_disc(track, new_disc)
+        table = self.query_one("#matrix", DataTable)
+        self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+
+    def action_reorder_column(self, delta: int) -> None:
+        col = self.current_column()
+        if col is None:
+            return  # disc gutter isn't a reorderable column
+        self.model.push_history()
+        self.model.reorder_column(col, delta)
+        table = self.query_one("#matrix", DataTable)
+        new_col_idx = 1 + self.model.columns.index(col)  # +1 for disc gutter col
+        self.rebuild_table(keep_cursor=(table.cursor_row, new_col_idx))
+
+    def action_toggle_pin(self) -> None:
+        col = self.current_column()
+        if col is None:
+            return
+        self.model.push_history()
+        self.model.toggle_pin(col)
+        table = self.query_one("#matrix", DataTable)
+        new_col_idx = 1 + self.model.columns.index(col)
+        self.rebuild_table(keep_cursor=(table.cursor_row, new_col_idx))
 
     def action_undo(self) -> None:
-        frame = self.history.undo(self.files_by_id)
-        if frame is not None:
-            self.refresh_files()
-            self.refresh_tags(preserve_tag=self.current_tag)
-            self.notify(f"Undid: {frame.action}", timeout=3)
+        table = self.query_one("#matrix", DataTable)
+        if self.model.undo():
+            self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+            self.notify("Undo.")
+        else:
+            self.notify("Nothing to undo.", severity="warning")
 
     def action_redo(self) -> None:
-        frame = self.history.redo(self.files_by_id)
-        if frame is not None:
-            self.refresh_files()
-            self.refresh_tags(preserve_tag=self.current_tag)
-            self.notify(f"Redid: {frame.action}", timeout=3)
+        table = self.query_one("#matrix", DataTable)
+        if self.model.redo():
+            self.rebuild_table(keep_cursor=(table.cursor_row, table.cursor_column))
+            self.notify("Redo.")
+        else:
+            self.notify("Nothing to redo.", severity="warning")
 
-    def action_save_confirm(self) -> None:
-        lines = collapse_pending(self.history.pending_since_save())
-
-        def handle(confirmed: Optional[bool]) -> None:
+    def action_save(self) -> None:
+        def handle(confirmed: bool | None) -> None:
             if confirmed:
-                self.do_save()
+                failures = self.model.save_all()
+                if failures:
+                    detail = "; ".join(f"{t.filename}: {err}" for t, err in failures[:3])
+                    more = f" (+{len(failures) - 3} more)" if len(failures) > 3 else ""
+                    self.notify(
+                        f"{len(failures)} file(s) failed to save: {detail}{more}",
+                        severity="error",
+                        timeout=10,
+                    )
+                else:
+                    self.notify("Saved.")
 
-        self.push_screen(ConfirmModal("Save these changes to disk?", lines), handle)
+        self.app.push_screen(SaveDiffScreen(self.model), handle)
 
-    def do_save(self) -> None:
-        for f in self.files:
-            f.write_to_disk()
-        self.history.mark_saved()
-        self.notify("Saved.", timeout=3)
-
-    def action_quit_confirm(self) -> None:
-        if not self.history.dirty:
-            self.exit()
+    def action_request_quit(self) -> None:
+        if not self.model.has_unsaved_changes():
+            self.app.exit()
             return
 
-        def handle(confirmed: Optional[bool]) -> None:
+        def handle(confirmed: bool | None) -> None:
             if confirmed:
-                self.exit()
+                self.app.exit()
 
-        self.push_screen(ConfirmModal("Unsaved changes", ["Quit without saving?"]), handle)
+        self.app.push_screen(
+            ConfirmQuitScreen("You have unsaved changes. Quit without saving?"),
+            handle,
+        )
+
+    def action_cover_art(self) -> None:
+        self.app.push_screen(CoverArtScreen(self.model))
+
+
+class CoverArtScreen(Screen):
+    """Grid/filmstrip-style single-track view over the cover art page.
+    Thumbnails are decoded+resized once via the model's shared
+    ThumbnailCache (keyed on the image bytes themselves), so navigating
+    between tracks or reopening this page never re-decodes an image
+    that's already been seen -- that repeated full-res decode/resize on
+    every visit was the freeze in the old app.
+    """
+
+    DEFAULT_CSS = """
+    CoverArtScreen #art_preview_box {
+        height: 24;
+        align: center middle;
+        border: round $accent;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape,q", "back", "Back to matrix"),
+        Binding("r", "replace", "Replace cover"),
+        Binding("shift+a", "apply_all", "Apply to all"),
+        Binding("e", "export", "Export cover art"),
+    ]
+
+    def __init__(self, model: MatrixModel) -> None:
+        super().__init__()
+        self.model = model
+        self.index = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical():
+            yield Static("", id="art_info")
+            with Container(id="art_preview_box"):
+                yield TermImage(id="art_preview")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_info()
+
+    def refresh_info(self) -> None:
+        tracks = self.model.ordered_tracks()
+        if not tracks:
+            return
+        track = tracks[self.index % len(tracks)]
+        has_art = "yes" if track.cover_art else "no"
+        info = self.query_one("#art_info", Static)
+        info.update(
+            f"Track {self.index + 1}/{len(tracks)}: {track.filename}\n"
+            f"Has cover art: {has_art}\n"
+            f"[r] replace this track's cover  [shift+A] apply this image to ALL tracks  "
+            f"[e] export full-size cover  [left/right] switch track  [esc] back"
+        )
+        preview = self.query_one("#art_preview", TermImage)
+        if track.cover_art:
+            # Cache lookup only -- decode/resize happens at most once per
+            # distinct image, not on every navigation.
+            thumb = self.model.thumbnail_cache.get(track.cover_art)
+            preview.image = thumb
+            preview.styles.display = "block"
+        else:
+            preview.image = None
+            preview.styles.display = "none"
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_replace(self) -> None:
+        def handle(path_str: str | None) -> None:
+            if not path_str:
+                return
+            p = Path(path_str.strip())
+            if not p.exists():
+                self.notify(f"File not found: {p}", severity="error")
+                return
+            tracks = self.model.ordered_tracks()
+            track = tracks[self.index % len(tracks)]
+            try:
+                data = p.read_bytes()
+            except OSError as exc:
+                self.notify(f"Couldn't read image: {exc}", severity="error")
+                return
+            self.model.push_history()
+            track.cover_art = data
+            self.refresh_info()
+
+        self.app.push_screen(PromptScreen("Path to image file:"), handle)
+
+    def action_apply_all(self) -> None:
+        tracks = self.model.ordered_tracks()
+        if not tracks:
+            return
+        track = tracks[self.index % len(tracks)]
+        if track.cover_art is None:
+            self.notify("Current track has no cover art to broadcast.", severity="warning")
+            return
+        self.model.push_history()
+        # Every track gets the same bytes object, so the thumbnail cache
+        # sees one cache key across all of them -- broadcasting to N
+        # tracks never triggers N decodes.
+        shared_bytes = track.cover_art
+        for t in tracks:
+            t.cover_art = shared_bytes
+        self.notify(f"Applied this cover to all {len(tracks)} tracks (staged, not yet saved).")
+        self.refresh_info()
+
+    def action_export(self) -> None:
+        tracks = self.model.ordered_tracks()
+        if not tracks:
+            return
+        track = tracks[self.index % len(tracks)]
+        if track.cover_art is None:
+            self.notify("This track has no cover art to export.", severity="warning")
+            return
+
+        def handle(path_str: str | None) -> None:
+            if not path_str:
+                return
+            dest = Path(path_str.strip()).expanduser()
+            if dest.is_dir():
+                mime = sniff_mime(track.cover_art)
+                ext = ".png" if mime == "image/png" else ".gif" if mime == "image/gif" else ".jpg"
+                dest = dest / f"{track.path.stem}_cover{ext}"
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(track.cover_art)
+            except OSError as exc:
+                self.notify(f"Export failed: {exc}", severity="error")
+                return
+            self.notify(f"Exported full-size cover to {dest}")
+
+        self.app.push_screen(
+            PromptScreen("Export path (file or folder):", initial=str(Path.cwd())),
+            handle,
+        )
+
+    def key_left(self) -> None:
+        self.index -= 1
+        self.refresh_info()
+
+    def key_right(self) -> None:
+        self.index += 1
+        self.refresh_info()
+
+
+class MersikApp(App):
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+    """
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.model = MatrixModel()
+
+    def on_mount(self) -> None:
+        failures = self.model.load_directory(self.root)
+        self.push_screen(MatrixScreen(self.model))
+        if failures:
+            detail = "; ".join(f"{p.name}: {err}" for p, err in failures[:3])
+            more = f" (+{len(failures) - 3} more)" if len(failures) > 3 else ""
+            self.notify(
+                f"{len(failures)} file(s) skipped (failed to load): {detail}{more}",
+                severity="error",
+                timeout=10,
+            )
 
 
 def main() -> None:
-    directory = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path.cwd()
-    if not directory.is_dir():
-        print(f"Not a directory: {directory}", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print("Usage: python app.py <folder>")
         sys.exit(1)
-    TagEditorApp(directory).run()
+    root = Path(sys.argv[1]).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Not a directory: {root}")
+        sys.exit(1)
+    MersikApp(root).run()
 
 
 if __name__ == "__main__":
