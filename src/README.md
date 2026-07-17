@@ -144,6 +144,10 @@ redo stack. Capped at 100 entries.
   doesn't roll back files that already saved, and the user is told
   exactly which files failed and why.
 
+## Formal test plan (95 tests across 12 areas)
+
+See `./src/TEST_PLAN.md` for the full test plan.
+
 ## Testing approach so far
 
 No formal test suite file exists yet — validation has been done ad hoc
