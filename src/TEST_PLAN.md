@@ -3,6 +3,17 @@
 **12 areas, ~95 tests.** Each test is designed to be runnable by both
 developers (`pytest tests/`) and by AI during implementation sessions.
 
+> **Status: implemented.** `tests/` at the repo root now contains a
+> pytest suite following this plan (139 passing, 1 environment-dependent
+> skip, 2 intentional `xfail(strict=True)` documenting real bugs the
+> suite found — see "Known issues found by the test suite" in
+> `src/README.md`). Test names below match the actual test functions
+> where the plan and implementation agree; a handful of Area I tests
+> were renamed/adjusted from what's listed here once writing them
+> against the real code revealed the pinning logic is `OR`, not `AND` --
+> see `src/README.md` for details. Run `pytest tests/ -v` from the repo
+> root to execute the suite.
+
 ---
 
 ## I. Data Model — `models.py` (29 tests)
@@ -205,19 +216,22 @@ developers (`pytest tests/`) and by AI during implementation sessions.
 
 ## Test Run Commands
 
+Run these from the **repo root** (`tests/` is a sibling of `src/`, not
+nested inside it):
+
 ```bash
 # Run all tests
 pytest tests/ -v
 
 # Run a specific area
-pytest tests/test_models.py -v        # Data model (I)
-pytest tests/test_column_ops.py -v    # Column operations (II)
+pytest tests/test_models.py -v         # Data model (I)
+pytest tests/test_column_ops.py -v     # Column operations (II)
 pytest tests/test_disc_numbering.py -v # Disc/numbering (III)
-pytest tests/test_save_diff.py -v     # Effective tags/diff/save (IV)
-pytest tests/test_undo_redo.py -v     # Undo/redo (V)
-pytest tests/test_cli_app.py -v       # CLI/App (VI)
-pytest tests/test_ui.py -v            # UI headless (VII)
-pytest tests/test_edge_cases.py -v    # Edge cases (VIII)
+pytest tests/test_save_diff.py -v      # Effective tags/diff/save (IV)
+pytest tests/test_undo_redo.py -v      # Undo/redo (V)
+pytest tests/test_cli_app.py -v        # CLI/App (VI)
+pytest tests/test_ui.py -v             # UI headless (VII)
+pytest tests/test_edge_cases.py -v     # Edge cases (VIII)
 
 # Run with coverage
 pytest tests/ --cov=src --cov-report=term-missing -v
@@ -226,23 +240,51 @@ pytest tests/ --cov=src --cov-report=term-missing -v
 ## File Structure
 
 ```
-tests/
-  conftest.py              # Fixtures: temp FLAC files, test directories
-  test_models.py           # Area I
-  test_column_ops.py       # Area II
-  test_disc_numbering.py   # Area III
-  test_save_diff.py        # Area IV
-  test_undo_redo.py        # Area V
-  test_cli_app.py          # Area VI
-  test_ui.py               # Area VII
-  test_edge_cases.py       # Area VIII
+mersik/                     # repo root
+  src/
+    app.py
+    models.py
+    README.md
+    TEST_PLAN.md            # this file
+  tests/
+    conftest.py             # fixtures: temp FLAC files, in-memory model, PNG bytes
+    test_models.py          # Area I
+    test_column_ops.py      # Area II
+    test_disc_numbering.py  # Area III
+    test_save_diff.py       # Area IV
+    test_undo_redo.py       # Area V
+    test_cli_app.py         # Area VI
+    test_ui.py              # Area VII
+    test_edge_cases.py      # Area VIII
+  pytest.ini                # asyncio_mode = auto, testpaths = tests
 ```
+
+Note: `app.py`/`models.py` use plain top-level imports (`from models
+import ...`), not a package-relative import, so `tests/conftest.py`
+inserts `src/` onto `sys.path` at collection time. This is why tests
+import with `from models import ...` / `import app as app_module`
+rather than `from src.models import ...`.
 
 ## Fixture Strategy
 
-- `temp_flac_dir`: Creates a temp directory with synthetic FLAC files
-  (via `mutagen` + silent audio bytes from `io.BytesIO`).
-- `temp_image_file`: Creates a small valid PNG/JPEG file for cover art tests.
-- `temp_empty_dir`: Empty temp directory for "no FLAC" edge cases.
-- `model_with_tracks`: Pre-populated `MatrixModel` with 3 tracks,
-  multiple discs, and known tag values for deterministic testing.
+- `make_flac(path, tags, picture=None)` (in `conftest.py`, not a
+  fixture itself but used by several fixtures/tests directly): creates
+  a real, valid FLAC file via `ffmpeg` (silent audio stream) +
+  `mutagen` (exact Vorbis comments, optional embedded cover), clearing
+  ffmpeg's own `encoder` tag first so fixture data is exactly what the
+  test specifies.
+- `temp_flac_dir`: two-track single-disc album with matching
+  ALBUM/ALBUMARTIST, differing ARTIST/TITLE, a duplicate-key
+  (`REPLAYGAIN_TRACK_GAIN` x2) case, and one embedded cover.
+- `temp_multidisc_dir`: two discs, two tracks each, real `DISCNUMBER`
+  tags on disk.
+- `temp_empty_dir`: empty directory for "no FLAC files" edge cases.
+- `png_bytes` / `make_png_bytes(...)`: small real PNG bytes for cover
+  art tests, via Pillow.
+- `model_with_tracks`: a `MatrixModel` built **entirely in memory** (no
+  disk I/O, no ffmpeg dependency) with 3 tracks across 2 discs and a
+  mix of pinned/unpinned columns — used for the column-ops,
+  disc-ordering, and undo/redo suites, which don't need real files and
+  run faster without them.
+- A session-scoped `autouse` fixture skips the whole run if `ffmpeg` is
+  not on `PATH`, since every disk-based fixture depends on it.

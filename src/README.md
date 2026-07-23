@@ -148,18 +148,89 @@ redo stack. Capped at 100 entries.
 
 See `./src/TEST_PLAN.md` for the full test plan.
 
-## Testing approach so far
+## Testing
 
-No formal test suite file exists yet — validation has been done ad hoc
-via a scratch script pattern: generate silent FLAC files with ffmpeg,
-tag them with mutagen (including a deliberate duplicate-key case),
-then either (a) exercise `MatrixModel` methods directly and assert on
-the results, or (b) drive `MersikApp` headlessly via Textual's
-`app.run_test()` / `Pilot` (`await pilot.press(...)`, inspect
-`app.screen_stack`, `DataTable` state, etc.). Every feature described
-above has been exercised this way at least once. If picking this back
-up, it's worth turning this into an actual `tests/` directory with
-pytest rather than re-deriving the scratch scripts each session.
+A real `tests/` directory now exists at the repo root (sibling to `src/`),
+implemented with pytest against the plan in `TEST_PLAN.md`. It supersedes
+the old ad-hoc scratch-script workflow described in earlier revisions of
+this file.
+
+```
+pip install textual mutagen textual-image pillow rich pytest pytest-asyncio
+pytest tests/ -v
+
+# with coverage
+pip install pytest-cov
+pytest tests/ --cov=src --cov-report=term-missing -v
+```
+
+Structure:
+- `tests/conftest.py` -- fixtures. `make_flac()` synthesizes real, valid
+  FLAC files via `ffmpeg` (silent audio) + `mutagen` (exact tags/cover
+  art), the same technique the old scratch scripts used. `model_with_tracks`
+  builds a `MatrixModel` entirely in memory (no disk I/O, no ffmpeg) for
+  fast column/undo/disc-ordering tests. **Requires `ffmpeg` on PATH** for
+  any disk-based fixture (`temp_flac_dir`, `temp_multidisc_dir`, etc.) --
+  the session automatically skips if it's missing.
+- `tests/test_models.py` -- loader + data model (Area I)
+- `tests/test_column_ops.py` -- add/duplicate/delete/pin/reorder (Area II)
+- `tests/test_disc_numbering.py` -- disc grouping, auto-number (Area III)
+- `tests/test_save_diff.py` -- effective tags, diffing, save (Area IV)
+- `tests/test_undo_redo.py` -- history stack (Area V)
+- `tests/test_cli_app.py` -- `main()`, app mount/load (Area VI)
+- `tests/test_ui.py` -- headless UI via Textual's `Pilot`, one `async def`
+  per keybind/screen (Area VII)
+- `tests/test_edge_cases.py` -- empty model, symlink loops, permission
+  errors, mixed file types (Area VIII)
+
+Two tests are marked `xfail(strict=True)` rather than deleted or loosened,
+because they caught real gaps between what the app *appears* to do and
+what it actually persists -- see "Known issues found by the test suite"
+below. If you fix the underlying code, these tests will start passing,
+and pytest will then error on the stale `xfail` marker (that's
+`strict=True` doing its job) -- delete the marker at that point rather
+than leaving it.
+
+When extending the app, add tests to the matching file above by area
+rather than a new ad hoc file per feature, and update `TEST_PLAN.md`'s
+table alongside any new test so the two stay in sync.
+
+## Known issues found by the test suite
+
+1. **`auto_number()` results never reach disk.** `Track.write_to_disk()`
+   only writes ordinary tag-column slots (`self.slots`); it never reads
+   `track.computed_tracknumber/tracktotal/discnumber/disctotal`.
+   `get_effective_tags()` -- used by `diff_for_track()` and thus the
+   save-diff screen -- *does* include those computed fields, so the UI
+   can show a TRACKNUMBER/DISCNUMBER change in the save-diff preview
+   that then silently fails to be written after confirming save. Fix by
+   having `write_to_disk` (or `save_all`) consult the same `computed_*`
+   attributes. Covered by
+   `tests/test_save_diff.py::test_save_writes_structural_tags`
+   (currently `xfail`).
+2. **`move_track()` has no bounds/membership check.** It calls
+   `tracks_in_disc(track.disc).index(track)`, which raises `ValueError`
+   if `track` isn't actually a member of `self.tracks` (for example, a
+   stale reference, or calling it against an empty model). In normal UI
+   usage this can't currently happen -- `MatrixScreen.action_move_row`
+   only ever passes `current_track()`, which is always drawn from the
+   live model -- but the method itself has no defensive guard. Covered
+   by `tests/test_edge_cases.py::test_move_track_no_tracks` (currently
+   `xfail`).
+3. **Pinning logic is OR, not AND, despite the prose below.** The
+   "Loading auto-pins..." paragraph two sections up describes pinning as
+   requiring both standard-key membership *and* identical values, but
+   `load_directory()`'s actual condition is
+   `pinned = is_standard or (all_same and i == 0)`. In practice this
+   means: (a) STANDARD_KEYS are pinned unconditionally, even when tracks
+   disagree on the value (contradicting the prose, but already flagged
+   as a wanted behavior change in "Additional features to implement"
+   item 6 below); and (b) a *non-standard* key with an identical value
+   across every track also gets auto-pinned, which the prose doesn't
+   mention at all. Covered by
+   `tests/test_models.py::test_load_standard_key_pinned_even_if_values_differ`
+   and `test_load_non_standard_same_value_also_pinned` (both passing --
+   documenting current behavior, not asserting it's correct).
 
 ## What's left to implement
 
@@ -195,12 +266,15 @@ Roughly in suggested priority order:
      while a session has them open — a save would silently clobber
      external changes.
 
-6. **Formal test suite.** Convert the ad hoc scratch-script validation
-   pattern described above into an actual `tests/` directory.
-
 Nothing above blocks normal use of the app — it's fully functional as
 described in the keybind sections. These are the known gaps as of the
-last working session.
+last working session. (Item 6, "Formal test suite," from an earlier
+revision of this list is done — see `tests/` and the "Testing" section
+above. Item 4, load-time robustness for symlink loops/permission-denied
+directories, has partial coverage in `tests/test_edge_cases.py`, which
+exercises but does not fix either case; both currently pass without
+hanging or crashing but aren't asserted as *correct*, only as
+non-fatal.)
 
 ## Additional features to implement, on request by user
 
